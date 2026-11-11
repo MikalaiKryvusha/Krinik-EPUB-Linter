@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+# книги и отчёты с текстом книг в репозиторий не кладём
+*.epub
+*.fb2
+*.proofread.md
+*.proofread.json
+.DS_Store
