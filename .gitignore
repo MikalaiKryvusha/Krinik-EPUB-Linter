@@ -12,3 +12,6 @@ dist/
 *.proofread.md
 *.proofread.json
 .DS_Store
+*.textfix.md
+*.textfix.json
+*.fixes.json

@@ -18,8 +18,10 @@ import re
 
 CYR = 'А-Яа-яЁё'
 LAT = 'A-Za-z'
-REF_RE = re.compile(r' ?<a\b[^>]*>\s*(?:<sup[^>]*>)?\s*[\[{]?[\dIVXLCК]{1,5}[\]}]?\s*(?:</sup>)?\s*</a>')
-BLOCK_RE = re.compile(r'<(p|h[1-6]|li|td|th|dt|dd)\b[^>]*>(.*?)</\1>', re.S)
+REF_RE = re.compile(r' ?<a\b[^>]*>\s*(?:<sup[^>]*>)?\s*[\[{]?(?:[\dIVXLCК]{1,5}|\*{1,3})[\]}]?\s*(?:</sup>)?\s*</a>')
+# абзац — <p>, заголовок, пункт списка или <div> без вложенных блоков (у Calibre абзацы — <div class="paragraph">)
+BLOCK_RE = re.compile(r'<(p|div|h[1-6]|li|td|th|dt|dd)\b[^>]*>'
+                      r'((?:(?!<(?:p|div|h[1-6]|li|table|ul|ol|blockquote)\b).)*?)</\1>', re.S)
 
 # правила LanguageTool, которые на художественной и научной прозе дают в основном шум
 LT_DISABLED = {

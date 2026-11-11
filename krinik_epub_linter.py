@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Krinik EPUB Linter — проверка и причёсывание сносок в EPUB-книгах.
+"""Krinik EPUB Linter — проверка и починка сносок и русского текста в EPUB-книгах.
 
 Команды:
-  survey  BOOK.epub ...            показать, как устроены сноски, и найти проблемы
-  fix     BOOK.epub ... -o DIR     привести сноски к виду [N] и сохранить в DIR
-  check   BOOK.epub ...            проверить уже исправленную книгу
-  proofread BOOK.epub ... -o DIR   корректура (орфография, грамматика, пунктуация) — только отчёт
+  survey    BOOK.epub ...            показать, как устроены сноски, разделители, что не так
+  fix       BOOK.epub ... -o DIR     привести сноски к виду [N] (крупно, кликабельно в обе стороны)
+  check     BOOK.epub ...            проверить исправленную книгу (код возврата 1 при проблемах)
+  proofread BOOK.epub ... -o DIR     корректура: орфография, грамматика, пунктуация — только отчёт
+  textfix   BOOK.epub ... -o DIR     правка текста с журналом: --auto (техника), --apply правки.json
 
-Рассчитан на EPUB, сконвертированные из FB2 (типичные «*.fb2.epub»):
-примечания там лежат как <span id=..><div class="titleN"><p>N</p></div><p>текст</p></span>.
+Понимает сноски: номер отдельным заголовком (fb2 -> epub), «[N] текст» (Calibre и др.),
+надстрочные <sup>/{N}/[002], звёздочки «слово*» + «*Текст». Оригиналы не меняются.
 Только стандартная библиотека Python 3.8+ (для proofread — опционально LanguageTool).
 """
 import argparse
@@ -19,6 +20,8 @@ import re
 import sys
 import zipfile
 
+__version__ = '1.0.0'
+
 NBSP = ' '
 # Ссылки — обычным текстом, крупно: свой класс + явный стиль, перебивающий
 # типичное для конвертеров «.a { font-size: 0.7em; vertical-align: super }».
@@ -28,16 +31,37 @@ FN_ATTRS = 'class="%s" style="%s"' % (FN_CLASS, FN_STYLE)
 FN_CSS = ('\n/* Krinik EPUB Linter: сноски обычным текстом, не надстрочным */\n'
           'a.%s { font-size: 1em !important; vertical-align: baseline !important; '
           'line-height: inherit !important; }\n' % FN_CLASS)
-SMALL_OPEN = re.compile(r'<(sup|small)\b[^>]*>\s*$')
+# обёртки, делающие номер мелким: <sup>, <small>, <span class="sup">
+SMALL_OPEN = re.compile(r'<(sup|small|span(?=[^>]*\bclass="[^"]*\bsup\b))\b[^>]*>\s*$')
 WS = ' \t\r\n' + NBSP
 INLINE = {'em', 'strong', 'i', 'b', 'span', 'sup', 'sub', 'u', 's', 'small', 'code', 'a'}
 # знаки, которые остаются «приклеенными» сразу после ссылки: «Царств [20], – заметил»
 GLUE = set('.,;:!?…»)”"\'’]')
 LABEL_RE = re.compile(r'\d+|[IVXLC]+')
-A_RE = re.compile(r'<a\b([^>]*)>(.*?)</a>', re.S)
+# <a .../> (самозакрывающаяся) — не открывающий тег, иначе захватим всё до следующего </a>
+A_RE = re.compile(r'<a\b([^>]*?)(?<!/)>(.*?)</a>', re.S)
 HREF_RE = re.compile(r'href="([^"#]*)#([^"]+)"')
+# формат 1 (fb2 -> epub): номер отдельным заголовком
 NOTE_TMPL = (r'<span id="%s">\s*<div class="title\d">\s*<p class="p">([^<]*)</p>\s*</div>\s*'
              r'(<p\b[^>]*>)')
+# формат 2 (Calibre и др.): элемент с id, текст которого начинается с «[N]» или ссылки «[N]»
+NOTE_LABEL = r'(?:[^\W\d_]{1,3})?\d+|[IVXLC]+|\*{1,3}'
+# сноски-звёздочки: «слово*» в тексте и абзац «*Текст сноски» ниже в том же файле
+AST_BODY_RE = re.compile(r'<p\b([^>]*)>(\s*(?:<(?:em|strong|i|b)\b[^>]*>\s*)?)(\*{1,3})\s*(?=[^\s*<])')
+AST_REF_RE = re.compile(r'(?<=[\w»).,;:!?\]])(\*{1,3})(?=[\s.,;:!?»)\]—–-]|$)')
+
+
+def is_star(label):
+    return bool(re.fullmatch(r'\*+', label))
+NOTE_INLINE_TMPL = (r'(<(?!a\b)(\w+)\b[^>]*\bid="%s"[^>]*>(?:\s|<a\b[^>]*?/>|<a\b[^>]*>\s*</a>'
+                    r'|<(?:p|span|div)\b[^>]*>)*)'
+                    r'(?:<a\b[^>]*>\s*\[(' + NOTE_LABEL + r')\]\s*</a>|\[(' + NOTE_LABEL + r')\])'
+                    r'[ \t ]*(?=\S)')
+
+
+def norm_label(s):
+    """[002] -> 2: убрать ведущие нули у номера."""
+    return re.sub(r'(?<!\d)0+(?=\d)', '', s)
 
 
 def plain(s):
@@ -105,27 +129,148 @@ def _note_spans(text):
     for m in re.finditer(NOTE_TMPL % '([^"]+)', text):
         lab = plain(m.group(2)).strip()
         if LABEL_RE.fullmatch(lab):
-            yield m.group(1), lab
+            yield m.group(1), norm_label(lab)
 
 
-def find_notes(book):
-    """{(файл, id): метка} — все примечания книги.
-
-    Примечание — блок «номер заголовком + текст». Чтобы не спутать с нумерованными
-    подзаголовками, берём только серии файлов (ch2-*.xhtml), где хотя бы на один
-    такой блок ведёт ссылка: так находятся и примечания, на которые ссылок нет.
-    """
-    spans = {fn: dict(_note_spans(t)) for fn, t in book.text.items()}
-    series = set()
+def _link_targets(book):
     for fn, t in book.text.items():
         for m in A_RE.finditer(t):
             h = HREF_RE.search(m.group(1))
             if h:
-                tf = book.resolve(fn, h.group(1))
-                if h.group(2) in spans.get(tf, ()):
-                    series.add(_series(tf))
-    return {(fn, nid): lab for fn, d in spans.items() if _series(fn) in series
-            for nid, lab in d.items()}
+                yield book.resolve(fn, h.group(1)), h.group(2)
+
+
+def find_notes(book):
+    """{(файл, id): метка} — все примечания книги; book.note_fmt[ключ] = 'title' | 'inline'.
+
+    Формат 'title' — блок «номер заголовком + текст» (fb2 -> epub). Чтобы не спутать
+    с нумерованными подзаголовками, берём только серии файлов (ch2-*.xhtml), где хотя бы
+    на один такой блок ведёт ссылка: так находятся и примечания, на которые ссылок нет.
+    Формат 'inline' — элемент с id, текст которого начинается с «[N]» (Calibre и др.);
+    такие берём только если на них ведёт ссылка.
+    """
+    spans = {fn: dict(_note_spans(t)) for fn, t in book.text.items()}
+    targets = set(_link_targets(book))
+    series = {_series(tf) for tf, tid in targets if tid in spans.get(tf, ())}
+    notes = {(fn, nid): lab for fn, d in spans.items() if _series(fn) in series
+             for nid, lab in d.items()}
+    book.note_fmt = dict.fromkeys(notes, 'title')
+    for key in sorted(targets - set(notes)):
+        t = book.text.get(key[0])
+        if t is None or 'id="%s"' % key[1] not in t:
+            continue
+        m = re.search(NOTE_INLINE_TMPL % re.escape(key[1]), t)
+        if m:
+            notes[key] = norm_label(m.group(3) or m.group(4))
+            book.note_fmt[key] = 'inline'
+    return notes
+
+
+def asterisk_notes(text):
+    """Сноски-звёздочки в одном файле: пары (ссылка «слово*», абзац «*Текст»).
+
+    Абзац со звёздочкой в начале связывается с ближайшей предшествующей свободной
+    ссылкой с тем же числом звёздочек. Возвращает (пары, ссылки без пары, абзацы без пары);
+    позиции — смещения в text.
+    """
+    def framed(s):
+        """«* Глава *», «*Глава*», «* * *» — звёздочки как оформление, не сноска."""
+        s = plain(s).strip()
+        return s.startswith('*') and s.endswith('*')
+
+    def para_at(pos):
+        a = text.rfind('<p', 0, pos)
+        e = text.find('</p>', pos)
+        return text[a:e if e >= 0 else len(text)]
+
+    bodies = [b for b in AST_BODY_RE.finditer(text) if not framed(para_at(b.start(3)))]
+    body_pos = {b.start(3) for b in bodies}
+    refs = []
+    for tm in re.finditer(r'>([^<]+)', text):
+        if framed(para_at(tm.start(1))):
+            continue
+        # «<em>чувства</em>*,—» — звёздочка сразу после закрывающего тега за словом
+        lead = re.match(r'\*{1,3}(?=[\s.,;:!?»)\]—–-]|$)', tm.group(1))
+        if (lead and tm.start(1) not in body_pos
+                and re.search(r'[\w»).,;:!?]</(?:em|strong|i|b|span)>$', text[max(0, tm.start(1) - 80):tm.start(1)])):
+            refs.append((tm.start(1), lead.group(0)))
+        for m in AST_REF_RE.finditer(tm.group(1)):
+            pos = tm.start(1) + m.start(1)
+            if pos not in body_pos:
+                refs.append((pos, m.group(1)))
+    used, pairs, lonely_bodies = set(), [], []
+    for b in bodies:
+        cands = [r for r in refs if r not in used and r[0] < b.start() and r[1] == b.group(3)]
+        if cands:
+            used.add(cands[-1])
+            pairs.append((cands[-1], b))
+        else:
+            lonely_bodies.append(b)
+    return pairs, [r for r in refs if r not in used], lonely_bodies
+
+
+def convert_asterisks(book):
+    """Пары «слово*» + «*Текст» -> обычные ссылка и примечание «[*] Текст»."""
+    report, n = [], 0
+    for fn in sorted(book.text):
+        t = orig = book.text[fn]
+        pairs, lonely_refs, lonely_bodies = asterisk_notes(t)
+        edits = []
+        for (pos, stars), b in pairs:
+            n += 1
+            idm = re.search(r'\bid="([^"]+)"', b.group(1))
+            nid = idm.group(1) if idm else 'krinik-ast%d' % n
+            edits.append((pos, pos + len(stars), '<a href="#%s" class="a">[%s]</a>' % (nid, stars)))
+            head = '<p%s%s>[%s] %s' % (b.group(1), '' if idm else ' id="%s"' % nid, stars, b.group(2))
+            edits.append((b.start(), b.end(), head))
+        for s, e, rep in sorted(edits, reverse=True):
+            t = t[:s] + rep + t[e:]
+        book.text[fn] = t
+        for pos, stars in lonely_refs:
+            report.append('ВНИМАНИЕ %s: «%s» без текста сноски — не тронуто: …%s'
+                          % (fn, stars, plain(orig[max(0, pos - 300):pos])[-40:].replace('\n', ' ')))
+        if len(lonely_bodies) > 3:
+            report.append('%s: %d абзацев начинаются со «*» без ссылок в тексте — похоже на список или '
+                          'библиографию, не тронуты' % (fn, len(lonely_bodies)))
+            lonely_bodies = []
+        for b in lonely_bodies:
+            report.append('ВНИМАНИЕ %s: абзац «%s…» без ссылки в тексте — не тронут'
+                          % (fn, plain(b.group(0) + orig[b.end():b.end() + 200])[:50]))
+    if n:
+        report.insert(0, 'сносок-звёздочек: %d — оформлены как [*]' % n)
+    return report
+
+
+SEP_BLOCK_RE = re.compile(r'<(p|h[1-6])\b([^>]*)>((?:(?!</\1>).)*)</\1>', re.S)
+SEPARATOR = '* * *'
+
+
+def find_separators(text):
+    """Абзацы-разделители из одних звёздочек (3 и больше) или «⁂»: [(match, вид)]."""
+    out = []
+    for m in SEP_BLOCK_RE.finditer(text):
+        shape = re.sub(r'\s+', ' ', plain(m.group(3)).replace(NBSP, ' ')).strip()
+        if re.fullmatch(r'\*{3,}|⁂', shape.replace(' ', '')):
+            out.append((m, shape))
+    return out
+
+
+def fix_separators(book):
+    """Привести разделители к единому виду «* * *» по центру. Включается флагом --separators."""
+    changed = collections.Counter()
+    for fn in sorted(book.text):
+        t = book.text[fn]
+        for m, shape in reversed(find_separators(t)):
+            attrs = m.group(2)
+            if 'style=' not in attrs:
+                attrs += ' style="text-align:center;text-indent:0"'
+            new = '<%s%s>%s</%s>' % (m.group(1), attrs, SEPARATOR, m.group(1))
+            if new != m.group(0):
+                t = t[:m.start()] + new + t[m.end():]
+                changed[shape] += 1
+        book.text[fn] = t
+    return ['разделители приведены к «%s»: %s' % (SEPARATOR, ', '.join('«%s» ×%d' % kv for kv in changed.items()))
+            ] if changed else []
 
 
 def note_series_title(text, pos):
@@ -144,7 +289,8 @@ def find_refs(book, notes):
                 continue
             key = (book.resolve(fn, h.group(1)), h.group(2))
             if key in notes:
-                shown = re.sub(r'[\[\]{}()*\s]', '', plain(m.group(2)))
+                shown = re.sub(r'[\[\]{}\s]', '', plain(m.group(2)))
+                shown = shown if is_star(shown) else norm_label(shown.strip('()*'))
                 refs.append((fn, m, key, shown))
     return refs
 
@@ -159,7 +305,8 @@ def plan(book, prefixes=None):
     # 1. Две серии с одинаковыми номерами (например, «Примечания» и «Комментарии»)
     by_label = collections.defaultdict(list)
     for key, lab in notes.items():
-        by_label[lab].append(key)
+        if not is_star(lab):                  # [*] повторяются в каждой главе — это нормально
+            by_label[lab].append(key)
     if prefixes:
         for key in notes:
             if key[0] in prefixes:
@@ -170,8 +317,8 @@ def plan(book, prefixes=None):
         for ser in per_series:
             if ser == main:
                 continue
-            fn = min(k[0] for k in notes if _series(k[0]) == ser)
-            first = min(m.start() for m in re.finditer(r'<span id="', book.text[fn]))
+            fn, nid = min(k for k in notes if _series(k[0]) == ser)
+            first = book.text[fn].find('id="%s"' % nid)
             title = note_series_title(book.text[fn], first + 1) or fn
             pref = (re.search(r'\w', title) or re.search('.', 'N')).group(0).upper()
             for key in notes:
@@ -238,8 +385,10 @@ def fix_before(seg, prev_is_link):
     return s + NBSP
 
 
-def fix_book(book, author=None, title=None, prefixes=None):
+def fix_book(book, author=None, title=None, prefixes=None, separators=False):
+    ast_report = (fix_separators(book) if separators else []) + convert_asterisks(book)
     notes, refs, labels, retarget, report = plan(book, prefixes)
+    report = ast_report + report
     by_file = collections.defaultdict(list)
     for r in refs:
         by_file[r[0]].append(r)
@@ -260,8 +409,10 @@ def fix_book(book, author=None, title=None, prefixes=None):
                 if close:
                     start, end = last + w.start(), end + close.end()
             parts.append(t[last:start])
-            parts.append('<a href="%s#%s" id="%s" %s>[%s]</a>'
-                         % (book.rel(fn, key[0]), key[1], rid, FN_ATTRS, labels[key]))
+            tip = re.search(r'\stitle="[^"]*"', m.group(1))   # всплывающий текст сноски — сохранить
+            parts.append('<a href="%s#%s" id="%s"%s %s>[%s]</a>'
+                         % (book.rel(fn, key[0]), key[1], rid, tip.group(0) if tip else '', FN_ATTRS,
+                            labels[key]))
             last = end
         parts.append(t[last:])
         for i in range(2, len(parts), 2):
@@ -278,9 +429,14 @@ def fix_book(book, author=None, title=None, prefixes=None):
         else:
             report.append('ВНИМАНИЕ %s#%s: на примечание [%s] нет ни одной ссылки' % (fn, nid, lab))
             link = '[%s] ' % lab
-        book.text[fn], k = re.subn(NOTE_TMPL % re.escape(nid),
-                                   lambda m, nid=nid, link=link: '<span id="%s">%s%s' % (nid, m.group(2), link),
-                                   book.text[fn], count=1)
+        if book.note_fmt[key] == 'title':
+            book.text[fn], k = re.subn(NOTE_TMPL % re.escape(nid),
+                                       lambda m, nid=nid, link=link: '<span id="%s">%s%s' % (nid, m.group(2), link),
+                                       book.text[fn], count=1)
+        else:
+            book.text[fn], k = re.subn(NOTE_INLINE_TMPL % re.escape(nid),
+                                       lambda m, link=link: m.group(1) + link,
+                                       book.text[fn], count=1)
         assert k == 1, key
 
     # пункты оглавления, ведущие на примечания с новой меткой («1» -> «К1»)
@@ -325,8 +481,15 @@ def safe_filename(s):
 # ---------------------------------------------------------------- обзор и проверка
 
 def survey(book):
+    saved = dict(book.text)
+    ast = convert_asterisks(book)          # только посмотреть: текст сразу возвращаем
+    book.text = saved
     notes, refs, labels, retarget, report = plan(book)
-    out = report[:]
+    out = ast + report
+    seps = collections.Counter(shape for t in book.text.values() for _, shape in find_separators(t))
+    if seps:
+        out.append('разделители из звёздочек (fix --separators приведёт к «%s»): %s'
+                   % (SEPARATOR, ', '.join('«%s» ×%d' % kv for kv in seps.most_common())))
     out.insert(0, 'примечаний: %d, ссылок на них: %d' % (len(notes), len(refs)))
     shapes = collections.Counter(re.sub(r'\d+', 'N', re.sub(r'<(\w+)[^>]*>', r'<\1>', m.group(2)))[:30]
                                  for _, m, _, _ in refs)
@@ -357,8 +520,8 @@ def check(book):
             ids[(fn, m.group(1))] = True
     nrefs = nnotes = 0
     note_labels = collections.Counter()
-    ref_re = re.compile(r'<a href="([^"]*)" id="fnref\d+" ([^>]*)>\[([^\]<]+)\]</a>')
-    note_re = re.compile(r'<span id="[^"]+"><p\b[^>]*><a href="([^"]*)" ([^>]*)>\[([^\]<]+)\]</a> ')
+    ref_re = re.compile(r'<a href="([^"]*)" id="fnref\d+"([^>]*)>\[([^\]<]+)\]</a>')
+    note_re = re.compile(r'<a href="([^"]*#fnref\d+)" ([^>]*)>\[([^\]<]+)\]</a> ')
     for fn, t in book.text.items():
         for rx, what in ((ref_re, 'ссылка'), (note_re, 'метка примечания')):
             for m in rx.finditer(t):
@@ -381,12 +544,13 @@ def check(book):
                 after = t[m.end():m.end() + 1]
                 if after and after not in WS and after not in GLUE and after != '<':
                     problems.append('%s: нет пробела после [%s]' % (fn, lab))
-    dup = sorted(lab for lab, n in note_labels.items() if n > 1)
+    dup = sorted(lab for lab, n in note_labels.items() if n > 1 and not is_star(lab))
     if dup:
         problems.append('разные примечания с одинаковой меткой: %s' % ', '.join('[%s]' % x for x in dup[:10]))
     if not nrefs:
         problems.append('не найдено ни одной ссылки в формате линтера — книга ещё не исправлена?')
-    left = find_notes(book)
+    find_notes(book)
+    left = [k for k, f in book.note_fmt.items() if f == 'title']
     if left:
         problems.append('примечаний в старом формате (номер отдельным заголовком): %d' % len(left))
     return ['ссылок: %d, примечаний: %d' % (nrefs, nnotes)] + problems
@@ -397,6 +561,7 @@ def check(book):
 def main(argv=None):
     p = argparse.ArgumentParser(prog='krinik_epub_linter', description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--version', action='version', version='Krinik EPUB Linter ' + __version__)
     sp = p.add_subparsers(dest='cmd', required=True)
     s = sp.add_parser('survey', help='показать, как устроены сноски')
     s.add_argument('books', nargs='+')
@@ -409,13 +574,54 @@ def main(argv=None):
     f.add_argument('--title', help='название для имени файла и метаданных (только для одной книги)')
     f.add_argument('--prefix', action='append', default=[], metavar='ФАЙЛ=ПРИСТАВКА',
                    help='вручную задать приставку меток для файла примечаний, напр. OPS/ch2.xhtml=К')
+    f.add_argument('--separators', action='store_true',
+                   help='привести разделители из звёздочек (***, *****, ⁂) к «* * *» по центру; '
+                        'сначала посмотрите survey — в формулах звёздочки бывают частью текста')
     r = sp.add_parser('proofread', help='корректура: орфография, грамматика, пунктуация (только отчёт)')
     r.add_argument('books', nargs='+')
     r.add_argument('-o', '--out', required=True, help='папка для отчётов (.md и .json)')
     r.add_argument('--no-lt', action='store_true', help='без LanguageTool, только встроенные проверки')
+    x = sp.add_parser('textfix', help='правка текста с журналом: --auto (техника) и/или --apply правки.json')
+    x.add_argument('books', nargs='+')
+    x.add_argument('-o', '--out', required=True, help='папка для результата и журналов (оригиналы не трогаются)')
+    x.add_argument('--auto', action='store_true',
+                   help='латинские буквы-двойники в русских словах и наоборот, пропущенный пробел после знака')
+    x.add_argument('--apply', metavar='ПРАВКИ.json', help='список правок по отчёту proofread (только для одной книги)')
     a = p.parse_args(argv)
 
     rc = 0
+    if a.cmd == 'textfix':
+        import json as _json
+
+        import krinik_textfix as kt
+        if not (a.auto or a.apply):
+            p.error('укажите --auto и/или --apply')
+        if a.apply and len(a.books) > 1:
+            p.error('--apply можно указать только для одной книги')
+        os.makedirs(a.out, exist_ok=True)
+        for path in a.books:
+            print('==', path)
+            book = Book(path)
+            dst = os.path.join(a.out, os.path.basename(path))
+            if os.path.abspath(dst) == os.path.abspath(path):
+                p.error('результат совпадает с исходным файлом: %s' % dst)
+            auto_log = kt.auto(book) if a.auto else None
+            done, skipped = kt.apply(book, kt.load_fixes(a.apply)) if a.apply else ([], [])
+            book.save(dst)
+            author, title = book.metadata()
+            base = os.path.splitext(dst)[0] + '.textfix'
+            with open(base + '.md', 'w', encoding='utf-8') as fh:
+                fh.write(kt.log_markdown('%s. %s' % (author, title), auto_log, done, skipped))
+            with open(base + '.json', 'w', encoding='utf-8') as fh:
+                _json.dump({'auto': [dict(zip(('file', 'context', 'old', 'new', 'reason'), r)) for r in auto_log or []],
+                            'applied': done, 'skipped': skipped}, fh, ensure_ascii=False, indent=1)
+            if auto_log is not None:
+                kinds = collections.Counter(r[4] for r in auto_log)
+                print('  технических исправлений: %d %s' % (len(auto_log), dict(kinds)))
+            if a.apply:
+                print('  правок применено: %d, пропущено: %d' % (len(done), len(skipped)))
+            print('  сохранено: %s\n  журнал: %s.md' % (dst, base))
+        return 0
     if a.cmd == 'proofread':
         import krinik_proofread as kp
         os.makedirs(a.out, exist_ok=True)
@@ -452,7 +658,7 @@ def main(argv=None):
             rc |= 0 if len(lines) == 1 else 1
         else:
             prefixes = dict(x.split('=', 1) for x in a.prefix) or None
-            lines = fix_book(book, a.author, a.title, prefixes)
+            lines = fix_book(book, a.author, a.title, prefixes, a.separators)
             author, title = book.metadata()
             name = safe_filename('%s. %s' % (author, title)) + '.epub'
             dst = os.path.join(a.out, name)

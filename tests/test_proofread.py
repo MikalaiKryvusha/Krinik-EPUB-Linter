@@ -61,3 +61,10 @@ def test_book_is_not_modified(tmp_path):
     assert kel.main(['proofread', str(path), '-o', str(tmp_path / 'r'), '--no-lt']) == 0
     assert path.read_bytes() == before
     assert (tmp_path / 'r' / 'b.proofread.md').exists()
+
+
+def test_calibre_div_paragraphs(tmp_path):
+    body = ('<div class="paragraph" id="a">Cтивен пошёл.</div>'
+            '<div class="wrap"><p>Внутренний абзац.</p></div><ul><li><p>Пункт.</p></li></ul>')
+    path = make_epub(tmp_path / 'b.epub', {'text.xhtml': body})
+    assert [p[2] for p in kp.paragraphs(kel.Book(str(path)))] == ['Cтивен пошёл.', 'Внутренний абзац.', 'Пункт.']

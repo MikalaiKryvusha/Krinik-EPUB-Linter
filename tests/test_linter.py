@@ -225,3 +225,125 @@ def test_fix_is_idempotent(book_path, tmp_path):
 def test_safe_filename():
     assert kel.safe_filename('А/Б: В?.') == 'А Б В'
     assert kel.safe_filename('Лю Цысинь. Воспоминания о прошлом Земли.') == 'Лю Цысинь. Воспоминания о прошлом Земли'
+
+
+# ---------------------------------------------------------------- формат «[N] текст» (Calibre и др.)
+
+def test_calibre_style_notes(tmp_path):
+    # ссылка с подсказкой title и <span>, примечание — отдельный файл, перед [1] пустые якоря оглавления
+    body = ('<p>для paucorum hominum<a href="n1.xhtml#id_1" title="немногих людей (лат.)." class="c10">'
+            '<span class="c11">[1]</span></a>и поэтому</p>')
+    note = ('<div class="paragraph" id="id_1"><a id="TOC_1" class="c9"></a><a class="c9" id="TOC_2"></a>'
+            '[1] немногих людей (<em>лат</em>.).</div>')
+    toc = '<ul><li><a href="n1.xhtml#TOC_1">1</a></li></ul>'
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body, 'n1.xhtml': note, 'toc.xhtml': toc}))
+    t = book.text['OPS/text.xhtml']
+    assert 'hominum' + NBSP + '[1] и поэтому' in kel.plain(t)
+    assert 'title="немногих людей (лат.)."' in t
+    n = book.text['OPS/n1.xhtml']
+    assert re.search(r'<a id="TOC_1" class="c9"></a><a class="c9" id="TOC_2"></a>'
+                     r'<a href="text\.xhtml#fnref1" [^>]*>\[1\]</a> немногих людей', n)
+    assert '<a href="n1.xhtml#TOC_1">1</a>' in book.text['OPS/toc.xhtml']   # оглавление не трогаем
+    assert kel.check(book)[1:] == []
+
+
+def test_zero_padded_labels_and_existing_backlink(tmp_path):
+    body = ('<p class="p" id="id204">judicent (ep. 79) <span class="sup"><a href="n.xhtml#id222" class="a">'
+            '[002]</a></span>. Поэтому</p>')
+    notes = ('<p class="p"><a href="text.xhtml#id206" class="a"/></p>'
+             '<p class="p" id="id222"><a href="text.xhtml#id204" class="a">[002]</a> если бы даже…</p>')
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body, 'n.xhtml': notes}))
+    t = book.text['OPS/text.xhtml']
+    assert 'judicent (ep. 79)' + NBSP + '[2]. Поэтому' in kel.plain(t)
+    assert 'class="sup"' not in t
+    n = book.text['OPS/n.xhtml']
+    assert '<a href="text.xhtml#id206" class="a"/>' in n               # самозакрывающийся якорь цел
+    assert re.search(r'<p class="p" id="id222"><a href="text\.xhtml#fnref1" [^>]*>\[2\]</a> если бы даже', n)
+    assert kel.check(book)[1:] == []
+
+
+def test_shakespeare_style_notes(tmp_path):
+    body = '<p class="p1">Место действия — Эльсинор <a href="ch2.xhtml#id66" class="a">[25]</a>.</p>'
+    notes = '<div id="id66"><p class="p1">[25] <em>Эльсинор </em>— город в Дании.</p></div>'
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body, 'ch2.xhtml': notes}))
+    assert 'Эльсинор' + NBSP + '[25].' in body_of(book)
+    assert re.search(r'<div id="id66"><p class="p1"><a href="text\.xhtml#fnref1" [^>]*>\[25\]</a> <em>Эльсинор',
+                     book.text['OPS/ch2.xhtml'])
+
+
+def test_self_closing_anchor_not_swallowed(tmp_path):
+    body = ('<p><a href="n.xhtml#x" class="a"/></p><p>Текст, который нельзя потерять.'
+            '<a href="n.xhtml#n1" class="a">[1]</a></p>')
+    notes = '<p id="n1">[1] Примечание.</p>'
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body, 'n.xhtml': notes}))
+    t = book.text['OPS/text.xhtml']
+    assert '<p><a href="n.xhtml#x" class="a"/></p><p>Текст, который нельзя потерять.' + NBSP in t
+
+
+def test_section_links_are_not_notes(tmp_path):
+    body = '<p>См. <a href="s.xhtml#s5">§ 5</a> и <a href="s.xhtml#s6">[6]</a>.</p>'
+    sect = '<h2 id="s5">§ 5</h2><p id="s6">Обычный абзац без метки.</p>'
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body, 's.xhtml': sect}))
+    assert book.text['OPS/text.xhtml'] == kel.Book(str(tmp_path / 'b.epub')).text['OPS/text.xhtml']
+
+
+# ---------------------------------------------------------------- сноски-звёздочки
+
+def test_asterisk_notes(tmp_path):
+    body = ('<p class="p">существует лишь номинально*; они обречены. Слово** и ещё.</p>'
+            '<p class="p">*Пусть тот, кто сочтёт это гиперболой.</p>'
+            '<p class="p"><em>**Платоновские идеи </em>можно описать.</p>'
+            '<p class="p">что* прежде и что* после — без сноски</p>'
+            '<p class="p">a*b*c = x*y</p>')
+    book, report = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body}))
+    t = book.text['OPS/text.xhtml']
+    p = kel.plain(t)
+    assert 'номинально' + NBSP + '[*]; они обречены. Слово' + NBSP + '[**] и ещё.' in p
+    assert re.search(r'<p class="p" id="krinik-ast\d+"><a href="#fnref\d+" [^>]*>\[\*\]</a> Пусть тот', t)
+    assert re.search(r'<a href="#fnref\d+" [^>]*>\[\*\*\]</a> <em>Платоновские идеи </em>', t)
+    assert 'что* прежде и что* после' in p and 'a*b*c = x*y' in p
+    assert any('без текста сноски' in r for r in report)
+    assert kel.check(book)[1:] == []
+
+
+@pytest.mark.parametrize('frame', [
+    '<p class="subtitle">* * *</p>', '<p>***</p>', '<p>*****</p>', '<p>*   *</p>',
+    '<p class="title">* Глава первая *</p>', '<p><em>*Глава вторая*</em></p>', '<p>** Часть II **</p>',
+])
+def test_asterisk_frames_are_not_notes(tmp_path, frame):
+    body = '<p>Текст до.</p>%s<p>Слово в тексте.</p>' % frame
+    path = make_epub(tmp_path / 'b.epub', {'text.xhtml': body})
+    book, _ = fixed(path)
+    assert book.text['OPS/text.xhtml'] == kel.Book(str(path)).text['OPS/text.xhtml']
+
+
+def test_frame_does_not_steal_reference(tmp_path):
+    body = ('<p>Слово*, дальше.</p><p class="title">* Глава *</p><p>*Текст сноски.</p>')
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body}))
+    t = book.text['OPS/text.xhtml']
+    assert '<p class="title">* Глава *</p>' in t
+    assert re.search(r'Слово <a href="#krinik-ast1"[^>]*>\[\*\]</a>, дальше', t)
+
+
+def test_separators_opt_in(tmp_path):
+    body = ('<p class="subtitle">* * *</p><p>***</p><p class="c" style="x">*****</p><p>⁂</p>'
+            '<p>*   *</p><p>* Глава *</p><p>a*b*c</p>')
+    path = make_epub(tmp_path / 'b.epub', {'text.xhtml': body})
+    book, _ = fixed(path)
+    assert book.text['OPS/text.xhtml'] == kel.Book(str(path)).text['OPS/text.xhtml']   # по умолчанию не трогаем
+    book, report = fixed(path, separators=True)
+    t = book.text['OPS/text.xhtml']
+    assert t.count('>* * *</p>') == 4
+    assert '<p style="text-align:center;text-indent:0">* * *</p>' in t
+    assert '<p class="c" style="x">* * *</p>' in t
+    assert '<p>*   *</p>' in t and '<p>* Глава *</p>' in t and '<p>a*b*c</p>' in t
+    assert any('разделители' in r for r in report)
+    assert any('разделители' in x for x in kel.survey(kel.Book(str(path))))
+
+
+def test_asterisk_after_inline_tag(tmp_path):
+    body = ('<p>условиям <em>внутреннего чувства</em>*,— то он способен.</p>'
+            '<p>материализм.</p><p>* Ср. «Критику чистого разума».</p>')
+    book, _ = fixed(make_epub(tmp_path / 'b.epub', {'text.xhtml': body}))
+    assert 'внутреннего чувства' + NBSP + '[*],— то он' in body_of(book)
+    assert '[*] Ср. «Критику' in body_of(book)

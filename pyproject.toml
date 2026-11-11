@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krinik-epub-linter"
-version = "0.1.0"
-description = "Krinik EPUB Linter — проверка и причёсывание сносок в EPUB-книгах"
+version = "1.0.0"
+description = "Krinik EPUB Linter — check and repair footnotes and Russian text in EPUB books"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
@@ -19,7 +19,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 krinik-epub-linter = "krinik_epub_linter:main"
 
 [tool.setuptools]
-py-modules = ["krinik_epub_linter", "krinik_proofread"]
+py-modules = ["krinik_epub_linter", "krinik_proofread", "krinik_textfix"]
 
 [tool.pytest.ini_options]
 pythonpath = [".", "tests"]
